@@ -1,0 +1,670 @@
+Import atomicfilekit
+
+Public Class SettingsPair
+    Private Property K As String
+    Private Property V As String
+    Public Sub Constructor(key As String, value As String)
+        K = key
+        V = value
+    End Sub
+    Public Function Key() As String
+        Return K
+    End Function
+    Public Function Value() As String
+        Return V
+    End Function
+End Class
+
+' Deliberately bounded ASCII wire codec; never calls permissive Json.Parse.
+Public Class SettingsWire
+    Public Shared Function Equal(left As String, right As String) As Boolean
+        Return String.Compare(left, right, True) = 0
+    End Function
+    Public Shared Function ContainsExact(values As Array Of String, value As String) As Boolean
+        For Each candidate As String In values
+            If SettingsWire.Equal(candidate, value) Then Return True
+        Next
+        Return False
+    End Function
+    Public Shared Sub SortOrdinal(values As Array Of String)
+        For i As Integer = 1 To Array.LastIndex(values)
+            Dim current As String = values(i)
+            Dim j As Integer = i - 1
+            While j >= 0
+                If String.Compare(values(j), current, True) <= 0 Then Exit While
+                values(j + 1) = values(j)
+                j -= 1
+            End While
+            values(j + 1) = current
+        Next
+    End Sub
+    Private Property Source As String
+    Private Property Position As Integer = 1
+    Public Shared Sub CheckBytes(data As Bytes, limit As Integer)
+        If data.Count > limit Then Throw New InvalidArgumentException("settings byte size")
+        Dim i As Integer = 0
+        While i < data.Count
+            Dim n As Integer = data.Item(i)
+            If n < 32 And n <> 9 And n <> 10 And n <> 13 Then Throw New InvalidArgumentException("settings NUL/control")
+            Dim count As Integer = 0
+            Dim scalar As Integer = n
+            If n >= 194 And n <= 223 Then
+                count = 1
+                scalar = n - 192
+            ElseIf n >= 224 And n <= 239 Then
+                count = 2
+                scalar = n - 224
+            ElseIf n >= 240 And n <= 244 Then
+                count = 3
+                scalar = n - 240
+            ElseIf n >= 128 Then
+                Throw New InvalidArgumentException("settings invalid UTF8 lead")
+            End If
+            If i + count >= data.Count Then Throw New InvalidArgumentException("settings truncated UTF8")
+            For j As Integer = 1 To count
+                Dim nextByte As Integer = data.Item(i + j)
+                If nextByte < 128 Or nextByte > 191 Then Throw New InvalidArgumentException("settings UTF8 continuation")
+                scalar = scalar * 64 + nextByte - 128
+            Next
+            If count = 1 And scalar < 128 Then Throw New InvalidArgumentException("settings overlong UTF8")
+            If count = 2 And scalar < 2048 Then Throw New InvalidArgumentException("settings overlong UTF8")
+            If count = 3 And scalar < 65536 Then Throw New InvalidArgumentException("settings overlong UTF8")
+            If scalar > 1114111 Or (scalar >= 55296 And scalar <= 57343) Then Throw New InvalidArgumentException("settings invalid scalar")
+            i += count + 1
+        End While
+    End Sub
+    Public Shared Sub CheckText(s As String, limit As Integer)
+        If String.LenBytes(s) > limit Then Throw New InvalidArgumentException("settings byte size")
+        SettingsWire.CheckBytes(Bytes.FromString(s, Text.Encodings.UTF8), limit)
+    End Sub
+    Public Shared Function ScalarCount(s As String) As Integer
+        Dim data As Bytes = Bytes.FromString(s, Text.Encodings.UTF8)
+        Dim total As Integer = 0
+        For i As Integer = 0 To data.Count - 1
+            If data.Item(i) < 128 Or data.Item(i) >= 192 Then total += 1
+        Next
+        Return total
+    End Function
+    Private Shared Function ScalarText(n As Integer) As String
+        If n < 1 Or n > 1114111 Or (n >= 55296 And n <= 57343) Then Throw New InvalidArgumentException("settings invalid escaped scalar")
+        Dim data As New Bytes()
+        If n < 128 Then
+            data.Append(n)
+        ElseIf n < 2048 Then
+            data.Append(192 + n \ 64)
+            data.Append(128 + n Mod 64)
+        ElseIf n < 65536 Then
+            data.Append(224 + n \ 4096)
+            data.Append(128 + (n \ 64) Mod 64)
+            data.Append(128 + n Mod 64)
+        Else
+            data.Append(240 + n \ 262144)
+            data.Append(128 + (n \ 4096) Mod 64)
+            data.Append(128 + (n \ 64) Mod 64)
+            data.Append(128 + n Mod 64)
+        End If
+        SettingsWire.CheckBytes(data, 4)
+        Return data.ToString(Text.Encodings.UTF8)
+    End Function
+    Public Shared Function Number(s As String) As Integer
+        If s = "" Or s = "-0" Then Throw New InvalidArgumentException("integer syntax")
+        Dim start As Integer = 1
+        Dim negative As Boolean = False
+        If String.Left(s, 1) = "-" Then
+            negative = True
+            start = 2
+        End If
+        If start > String.Len(s) Then Throw New InvalidArgumentException("integer syntax")
+        If String.Len(s) > start And String.Mid(s, start, 1) = "0" Then Throw New InvalidArgumentException("integer leading zero")
+        Dim answer As Integer = 0
+        For i As Integer = start To String.Len(s)
+            Dim digit As Integer = String.Asc(s, i) - 48
+            If digit < 0 Or digit > 9 Then Throw New InvalidArgumentException("integer syntax")
+            If answer < -922337203685477580 Then Throw New InvalidArgumentException("integer overflow")
+            If answer = -922337203685477580 And digit > 7 Then
+                If Not negative Or digit > 8 Then Throw New InvalidArgumentException("integer overflow")
+            End If
+            answer = answer * 10 - digit
+        Next
+        If negative Then Return answer
+        Return -answer
+    End Function
+    Public Shared Function Quote(s As String) As String
+        SettingsWire.CheckText(s, 4096)
+        Dim output As String = "\""
+        For i As Integer = 1 To String.LenBytes(s)
+            Dim c As String = String.MidBytes(s, i, 1)
+            Select Case c
+            Case "\"", "\\"
+                output += "\\" + c
+            Case "\n"
+                output += "\\n"
+            Case "\r"
+                output += "\\r"
+            Case "\t"
+                output += "\\t"
+            Case Else
+                output += c
+            End Select
+        Next
+        Return output + "\""
+    End Function
+    Public Shared Sub KeyCheck(s As String)
+        SettingsWire.CheckText(s, 64)
+        If s = "" Then Throw New InvalidArgumentException("empty settings key")
+        For i As Integer = 1 To String.LenBytes(s)
+            If String.Asc(String.MidBytes(s, i, 1)) > 127 Then Throw New InvalidArgumentException("settings key must be ASCII")
+        Next
+    End Sub
+    Private Sub Space()
+        While Position <= String.LenBytes(Source)
+            Dim c As String = String.MidBytes(Source, Position, 1)
+            If c <> " " And c <> "\n" And c <> "\r" And c <> "\t" Then Exit While
+            Position += 1
+        End While
+    End Sub
+    Private Function Peek() As String
+        Me.Space()
+        Return String.MidBytes(Source, Position, 1)
+    End Function
+    Private Sub Take(c As String)
+        If Me.Peek() <> c Then Throw New InvalidArgumentException("settings JSON token")
+        Position += 1
+    End Sub
+    Private Function Hex4() As Integer
+        Dim n As Integer = 0
+        For i As Integer = 1 To 4
+            Dim c As String = String.MidBytes(Source, Position, 1)
+            If c = "" Then Throw New InvalidArgumentException("truncated unicode escape")
+            Dim digit As Integer = String.IndexOf("0123456789abcdef", String.LCase(c))
+            If digit < 0 Then Throw New InvalidArgumentException("invalid unicode escape")
+            n = n * 16 + digit
+            Position += 1
+        Next
+        Return n
+    End Function
+    Private Function Text() As String
+        Me.Take("\"")
+        Dim answer As String = ""
+        While Position <= String.LenBytes(Source)
+            Dim c As String = String.MidBytes(Source, Position, 1)
+            Position += 1
+            If c = "\"" Then
+                SettingsWire.CheckText(answer, 4096)
+                Return answer
+            End If
+            If c = "\\" Then
+                c = String.MidBytes(Source, Position, 1)
+                Position += 1
+                If Not SettingsWire.ContainsExact(["\"", "\\", "/", "n", "r", "t", "b", "f", "u"], c) Then Throw New InvalidArgumentException("unsupported settings escape")
+                Select Case c
+                Case "\"", "\\", "/"
+                Case "n"
+                    c = "\n"
+                Case "r"
+                    c = "\r"
+                Case "t"
+                    c = "\t"
+                Case "b", "f"
+                    Throw New InvalidArgumentException("settings controls rejected")
+                Case "u"
+                    Dim scalar As Integer = Me.Hex4()
+                    If scalar >= 55296 And scalar <= 56319 Then
+                        If Not SettingsWire.Equal(String.MidBytes(Source, Position, 2), "\\u") Then Throw New InvalidArgumentException("missing low surrogate")
+                        Position += 2
+                        Dim low As Integer = Me.Hex4()
+                        If low < 56320 Or low > 57343 Then Throw New InvalidArgumentException("invalid low surrogate")
+                        scalar = 65536 + (scalar - 55296) * 1024 + low - 56320
+                    End If
+                    c = SettingsWire.ScalarText(scalar)
+                Case Else
+                    Throw New InvalidArgumentException("unsupported settings escape")
+                End Select
+            ElseIf String.Asc(c) < 32 Then
+                Throw New InvalidArgumentException("raw JSON control")
+            End If
+            answer += c
+            If String.LenBytes(answer) > 4096 Then Throw New InvalidArgumentException("settings string size")
+        End While
+        Throw New InvalidArgumentException("unterminated settings string")
+    End Function
+    Public Shared Function Index(values As Array Of SettingsPair, key As String) As Integer
+        For i As Integer = 0 To Array.LastIndex(values)
+            If SettingsWire.Equal(values(i).Key(), key) Then Return i
+        Next
+        Return -1
+    End Function
+    Public Shared Sub Unique(values As Array Of SettingsPair)
+        If Array.Count(values) > 128 Then Throw New InvalidArgumentException("too many settings")
+        For i As Integer = 0 To Array.LastIndex(values)
+            If values(i) Is Nil Then Throw New InvalidArgumentException("nil settings pair")
+            SettingsWire.KeyCheck(values(i).Key())
+            SettingsWire.CheckText(values(i).Value(), 4096)
+            For j As Integer = 0 To i - 1
+                If SettingsWire.Equal(values(i).Key(), values(j).Key()) Then Throw New InvalidArgumentException("duplicate settings key")
+            Next
+        Next
+    End Sub
+    Public Shared Function Encode(version As Integer, revision As Integer, values As Array Of SettingsPair) As String
+        If version < 1 Or version > 1000 Or revision < 0 Or revision > 2147483647 Then Throw New InvalidArgumentException("settings version/revision bounds")
+        SettingsWire.Unique(values)
+        Dim keys As Array Of String = []
+        For Each pair As SettingsPair In values
+            Array.Append(keys, pair.Key())
+        Next
+        SettingsWire.SortOrdinal(keys)
+        Dim output As String = "{\"version\":\"" + Str(version) + "\",\"revision\":\"" + Str(revision) + "\",\"values\":{"
+        Dim separator As String = ""
+        For Each key As String In keys
+            output += separator + SettingsWire.Quote(key) + ":" + SettingsWire.Quote(values(SettingsWire.Index(values, key)).Value())
+            separator = ","
+        Next
+        output += "}}"
+        SettingsWire.CheckText(output, 65536)
+        Return output
+    End Function
+    Public Shared Function Decode(s As String) As SettingsDocument
+        SettingsWire.CheckText(s, 65536)
+        Dim parser As New SettingsWire()
+        parser.Source = s
+        Dim answer As New SettingsDocument()
+        Dim seen As Array Of String = []
+        parser.Take("{")
+        Do
+            Dim key As String = parser.Text()
+            If SettingsWire.ContainsExact(seen, key) Then Throw New InvalidArgumentException("duplicate envelope key")
+            If Not SettingsWire.ContainsExact(["version", "revision", "values"], key) Then Throw New InvalidArgumentException("unknown envelope key")
+            Array.Append(seen, key)
+            parser.Take(":")
+            Select Case key
+            Case "version"
+                answer.Version = SettingsWire.Number(parser.Text())
+            Case "revision"
+                answer.Revision = SettingsWire.Number(parser.Text())
+            Case "values"
+                parser.Take("{")
+                If parser.Peek() <> "}" Then
+                    Do
+                        Dim name As String = parser.Text()
+                        parser.Take(":")
+                        Array.Append(answer.Values, New SettingsPair(name, parser.Text()))
+                        If Array.Count(answer.Values) > 128 Then Throw New InvalidArgumentException("too many settings")
+                        If parser.Peek() <> "," Then Exit Do
+                        parser.Take(",")
+                    Loop
+                End If
+                parser.Take("}")
+            Case Else
+                Throw New InvalidArgumentException("unknown envelope key")
+            End Select
+            If parser.Peek() <> "," Then Exit Do
+            parser.Take(",")
+        Loop
+        parser.Take("}")
+        parser.Space()
+        If parser.Position <= String.LenBytes(s) Or Array.Count(seen) <> 3 Then Throw New InvalidArgumentException("settings envelope")
+        If answer.Version < 1 Or answer.Version > 1000 Or answer.Revision < 0 Or answer.Revision > 2147483647 Then Throw New InvalidArgumentException("settings version/revision bounds")
+        SettingsWire.Unique(answer.Values)
+        Return answer
+    End Function
+End Class
+
+Public Class SettingsDocument
+    Public Property Version As Integer
+    Public Property Revision As Integer
+    Public Property Values As Array Of SettingsPair = []
+End Class
+
+Public Class SettingsRule
+    Private Property Name As String
+    Private Property TypeName As String
+    Private Property DefaultText As String
+    Private Property Low As Integer
+    Private Property High As Integer
+    Private Property Allowed As Array Of String
+    Public Sub Constructor(key As String, kind As String, defaultValue As String, minimum As Integer, maximum As Integer, choices As Array Of String)
+        SettingsWire.KeyCheck(key)
+        If Not SettingsWire.ContainsExact(["text", "integer", "boolean"], kind) Then Throw New InvalidArgumentException("settings kind")
+        If minimum > maximum Then Throw New InvalidArgumentException("settings bounds")
+        Name = key
+        TypeName = kind
+        DefaultText = defaultValue
+        Low = minimum
+        High = maximum
+        Allowed = Array.Clone(choices)
+        Me.Validate(defaultValue)
+    End Sub
+    Public Function Key() As String
+        Return Name
+    End Function
+    Public Function Kind() As String
+        Return TypeName
+    End Function
+    Public Function DefaultValue() As String
+        Return DefaultText
+    End Function
+    Public Sub Validate(value As String)
+        SettingsWire.CheckText(value, 4096)
+        If Array.Count(Allowed) > 0 And Not SettingsWire.ContainsExact(Allowed, value) Then Throw New InvalidArgumentException("settings choice")
+        Select Case TypeName
+        Case "integer"
+            Dim n As Integer = SettingsWire.Number(value)
+            If n < Low Or n > High Then Throw New InvalidArgumentException("settings integer range")
+        Case "boolean"
+            If Not SettingsWire.ContainsExact(["true", "false"], value) Then Throw New InvalidArgumentException("settings boolean")
+        Case "text"
+            If SettingsWire.ScalarCount(value) < Low Or SettingsWire.ScalarCount(value) > High Then Throw New InvalidArgumentException("settings text length")
+        End Select
+    End Sub
+End Class
+
+Public Class SettingsSchema
+    Private Property SchemaVersion As Integer
+    Private Property Rules As Array Of SettingsRule
+    Public Sub Constructor(version As Integer, rules As Array Of SettingsRule)
+        If version < 1 Or version > 1000 Or Array.Count(rules) > 128 Then Throw New InvalidArgumentException("settings schema bounds")
+        SchemaVersion = version
+        Me.Rules = Array.Clone(rules)
+        For i As Integer = 0 To Array.LastIndex(rules)
+            If rules(i) Is Nil Then Throw New InvalidArgumentException("nil settings rule")
+            For j As Integer = 0 To i - 1
+                If SettingsWire.Equal(rules(i).Key(), rules(j).Key()) Then Throw New InvalidArgumentException("duplicate rule")
+            Next
+        Next
+    End Sub
+    Public Function Version() As Integer
+        Return SchemaVersion
+    End Function
+    Public Function Rule(key As String) As SettingsRule
+        For Each r As SettingsRule In Rules
+            If SettingsWire.Equal(r.Key(), key) Then Return r
+        Next
+        Throw New InvalidArgumentException("unknown settings key")
+    End Function
+    Public Function Normalize(values As Array Of SettingsPair) As Array Of SettingsPair
+        SettingsWire.Unique(values)
+        Dim answer As Array Of SettingsPair = []
+        For Each pair As SettingsPair In values
+            Dim r As SettingsRule = Me.Rule(pair.Key())
+            r.Validate(pair.Value())
+            If Not SettingsWire.Equal(pair.Value(), r.DefaultValue()) Then Array.Append(answer, pair)
+        Next
+        Me.Validate(Me.Effective(answer))
+        Return answer
+    End Function
+    Public Function Effective(values As Array Of SettingsPair) As Array Of SettingsPair
+        Dim answer As Array Of SettingsPair = []
+        For Each r As SettingsRule In Rules
+            Dim n As Integer = SettingsWire.Index(values, r.Key())
+            Dim value As String = r.DefaultValue()
+            If n >= 0 Then value = values(n).Value()
+            Array.Append(answer, New SettingsPair(r.Key(), value))
+        Next
+        Return answer
+    End Function
+    Public Sub Validate(values As Array Of SettingsPair)
+        ' Override to reject cross-field combinations. Values is a fresh array.
+    End Sub
+End Class
+
+Public Class SettingsMigration
+    Public Function Step(fromVersion As Integer, values As Array Of SettingsPair) As Array Of SettingsPair
+        Throw New InvalidArgumentException("missing settings migration")
+    End Function
+End Class
+
+Public Class SettingsStore
+    Public Function Load() As String
+        Throw New InvalidArgumentException("settings transport required")
+    End Function
+    Public Sub Save(expected As String, value As String)
+        Throw New InvalidArgumentException("settings transport required")
+    End Sub
+    Public Function Status() As String
+        Return "caller-transport"
+    End Function
+End Class
+Public Class SettingsMemoryStore Inherits SettingsStore
+    Private Property Raw As String = ""
+    Public Property FailWrites As Boolean = False
+    Public Overrides Function Load() As String
+        Return Raw
+    End Function
+    Public Overrides Sub Save(expected As String, value As String)
+        If FailWrites Then Throw New IOException("injected settings write failure")
+        If Not SettingsWire.Equal(Raw, expected) Then Throw New InvalidArgumentException("settings store conflict")
+        Raw = value
+    End Sub
+    Public Overrides Function Status() As String
+        Return "memory-only"
+    End Function
+End Class
+Public Class SettingsFileStore Inherits SettingsStore
+    Private Property FilePath As String
+    Public Sub Constructor(filePath As String)
+        Me.FilePath = filePath
+    End Sub
+    Public Overrides Function Load() As String
+        Dim f As New FileSystemItem(FilePath)
+        If Not f.Exists Then Return ""
+        Dim opened = BinaryStream.Open(f, False)
+        If Not opened.IsOk Then Throw New IOException("settings file read failed")
+        Dim stream As BinaryStream = opened.Value
+        Try
+            Dim length As Integer = stream.Length
+            If length <= 0 Or length > 65536 Then Throw New IOException("settings file size")
+            Dim data As Bytes = stream.Read(length)
+            If data.Count <> length Then Throw New IOException("settings short file read")
+            SettingsWire.CheckBytes(data, 65536)
+            Return data.ToString(Text.Encodings.UTF8)
+        Finally
+            stream.Close()
+        End Try
+    End Function
+    Private Property Cleanup As String = ""
+    Protected Sub Write(expected As String, value As String)
+        Dim f As New FileSystemItem(FilePath)
+        Dim existed As Boolean = f.Exists
+        Dim transaction As New AtomicFileTransaction(FilePath, 65536)
+        Try
+            transaction.Append(Bytes.FromString(value, Text.Encodings.UTF8))
+            If existed Then
+                transaction.CommitExpectedText(expected)
+            Else
+                transaction.Commit()
+            End If
+            If transaction.CleanupError <> "" Then Throw New AtomicFileException(transaction.CleanupError, transaction.IsCommitted)
+        Catch error As Exception
+            transaction.Abort()
+            If transaction.IsCommitted Then Throw New AtomicFileException(error.Message, True)
+            If transaction.CleanupError <> "" Then Throw New AtomicFileException(error.Message + "; " + transaction.CleanupError)
+            Throw error
+        Finally
+            transaction.Abort()
+        End Try
+    End Sub
+    Public Overrides Sub Save(expected As String, value As String)
+        If Not SettingsWire.Equal(Me.Load(), expected) Then Throw New InvalidArgumentException("settings store conflict")
+        Try
+            Me.Write(expected, value)
+            Cleanup = ""
+        Catch error As AtomicFileException
+            If Not error.IsCommitted Then Throw error
+            Cleanup = error.Message
+        End Try
+    End Sub
+    Public Function CleanupError() As String
+        Return Cleanup
+    End Function
+    Public Overrides Function Status() As String
+        If Cleanup <> "" Then Return "file-committed-cleanup-error"
+        Return "file-atomic-visible-directory-durability-unverified"
+    End Function
+End Class
+Public Class SettingsPrefsStore Inherits SettingsStore
+    Private Property Domain As String
+    Private Property Name As String
+    Public Sub Constructor(domain As String, key As String)
+        If domain = "" Or key = "" Then Throw New InvalidArgumentException("Prefs scope required")
+        Me.Domain = domain
+        Name = key
+    End Sub
+    Public Overrides Function Load() As String
+        Dim raw As String = Prefs.Get(Domain, Name, "")
+        If Prefs.Has(Domain, Name) And raw = "" Then Throw New IOException("Prefs empty or wrong type")
+        SettingsWire.CheckText(raw, 65536)
+        Return raw
+    End Function
+    Public Overrides Sub Save(expected As String, value As String)
+        If Not SettingsWire.Equal(Me.Load(), expected) Then Throw New InvalidArgumentException("settings store conflict")
+        Prefs.Set(Domain, Name, value)
+        If Not SettingsWire.Equal(Me.Load(), value) Then Throw New IOException("Prefs readback failed")
+    End Sub
+    Public Overrides Function Status() As String
+        Return "prefs-visible-durability-unverified"
+    End Function
+End Class
+
+Public Class Settings
+    Private Property Schema As SettingsSchema
+    Private Property Store As SettingsStore
+    Private Property Migration As SettingsMigration
+    Private Property Values As Array Of SettingsPair = []
+    Private Property CurrentRevision As Integer = 0
+    Private Property Raw As String = ""
+    Private Property Future As Boolean = False
+    Private Property Busy As Boolean = False
+    Private Property ObserverFailed As Boolean = False
+    Event Changed(keys As Array Of String, origin As String, revision As Integer)
+    Public Sub Constructor(schema As SettingsSchema, store As SettingsStore, migration As SettingsMigration)
+        If schema Is Nil Or store Is Nil Or migration Is Nil Then Throw New InvalidArgumentException("nil settings dependency")
+        Me.Schema = schema
+        Me.Store = store
+        Me.Migration = migration
+        Values = Schema.Normalize(Values)
+        Raw = Store.Load()
+        If Raw <> "" Then
+            Dim doc As SettingsDocument = SettingsWire.Decode(Raw)
+            CurrentRevision = doc.Revision
+            Future = doc.Version > Schema.Version()
+            If Not Future Then Values = Me.Migrate(doc)
+        End If
+    End Sub
+    Private Function Migrate(doc As SettingsDocument) As Array Of SettingsPair
+        Dim candidate As Array Of SettingsPair = Array.Clone(doc.Values)
+        For version As Integer = doc.Version To Schema.Version() - 1
+            candidate = Migration.Step(version, Array.Clone(candidate))
+            SettingsWire.Unique(candidate)
+        Next
+        Return Schema.Normalize(candidate)
+    End Function
+    Public Function Revision() As Integer
+        Return CurrentRevision
+    End Function
+    Public Function IsFuture() As Boolean
+        Return Future
+    End Function
+    Public Function Persistence() As String
+        Return Store.Status()
+    End Function
+    Public Function NotificationFailed() As Boolean
+        Return ObserverFailed
+    End Function
+    Public Function Get(key As String) As String
+        Dim r As SettingsRule = Schema.Rule(key)
+        Dim n As Integer = SettingsWire.Index(Values, key)
+        If n >= 0 Then Return Values(n).Value()
+        Return r.DefaultValue()
+    End Function
+    Public Function GetInteger(key As String) As Integer
+        If Schema.Rule(key).Kind() <> "integer" Then Throw New InvalidArgumentException("settings kind mismatch")
+        Return SettingsWire.Number(Me.Get(key))
+    End Function
+    Public Function GetBoolean(key As String) As Boolean
+        If Schema.Rule(key).Kind() <> "boolean" Then Throw New InvalidArgumentException("settings kind mismatch")
+        Return SettingsWire.Equal(Me.Get(key), "true")
+    End Function
+    Public Function Export() As String
+        If Future Then Return Raw
+        Return SettingsWire.Encode(Schema.Version(), CurrentRevision, Values)
+    End Function
+    Public Function Snapshot() As String
+        Return Me.Export()
+    End Function
+    Private Sub Guard(expected As Integer)
+        If Busy Then Throw New InvalidArgumentException("settings reentrancy")
+        If Future Then Throw New InvalidArgumentException("future settings read-only")
+        If expected <> CurrentRevision Then Throw New InvalidArgumentException("settings revision conflict")
+    End Sub
+    Private Sub Commit(candidate As Array Of SettingsPair, origin As String)
+        SettingsWire.CheckText(origin, 4096)
+        candidate = Schema.Normalize(candidate)
+        Dim changed As Array Of String = []
+        For Each pair As SettingsPair In Values
+            Dim n As Integer = SettingsWire.Index(candidate, pair.Key())
+            If n < 0 Then
+                Array.Append(changed, pair.Key())
+            ElseIf Not SettingsWire.Equal(candidate(n).Value(), pair.Value()) Then
+                Array.Append(changed, pair.Key())
+            End If
+        Next
+        For Each pair As SettingsPair In candidate
+            If SettingsWire.Index(Values, pair.Key()) < 0 Then Array.Append(changed, pair.Key())
+        Next
+        If Array.Count(changed) = 0 Then Return
+        If CurrentRevision = 2147483647 Then Throw New InvalidArgumentException("revision exhausted")
+        SettingsWire.SortOrdinal(changed)
+        Dim nextRaw As String = SettingsWire.Encode(Schema.Version(), CurrentRevision + 1, candidate)
+        Store.Save(Raw, nextRaw)
+        Values = candidate
+        Raw = nextRaw
+        CurrentRevision += 1
+        ObserverFailed = False
+        Try
+            RaiseEvent Changed(changed, origin, CurrentRevision)
+        Catch e As Exception
+            ObserverFailed = True
+        End Try
+    End Sub
+    Public Sub Apply(pairs As Array Of SettingsPair, expected As Integer, origin As String)
+        Me.Guard(expected)
+        Busy = True
+        Try
+            SettingsWire.Unique(pairs)
+            Dim candidate As Array Of SettingsPair = Array.Clone(Values)
+            For Each pair As SettingsPair In pairs
+                Dim n As Integer = SettingsWire.Index(candidate, pair.Key())
+                If n >= 0 Then Array.RemoveAt(candidate, n)
+                Array.Append(candidate, pair)
+            Next
+            Me.Commit(candidate, origin)
+        Finally
+            Busy = False
+        End Try
+    End Sub
+    Public Sub Import(text As String, expected As Integer, origin As String)
+        Me.Guard(expected)
+        Busy = True
+        Try
+            Dim doc As SettingsDocument = SettingsWire.Decode(text)
+            If doc.Version > Schema.Version() Then Throw New InvalidArgumentException("cannot import future settings")
+            Me.Commit(Me.Migrate(doc), origin)
+        Finally
+            Busy = False
+        End Try
+    End Sub
+    Public Sub Reset(key As String, expected As Integer, origin As String)
+        Dim pairs As Array Of SettingsPair = [New SettingsPair(key, Schema.Rule(key).DefaultValue())]
+        Me.Apply(pairs, expected, origin)
+    End Sub
+    Public Sub ResetAll(expected As Integer, origin As String)
+        Me.Guard(expected)
+        Busy = True
+        Try
+            Dim empty As Array Of SettingsPair = []
+            Me.Commit(empty, origin)
+        Finally
+            Busy = False
+        End Try
+    End Sub
+End Class
