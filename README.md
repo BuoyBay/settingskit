@@ -1,4 +1,4 @@
-# Manage typed transactional settings and persistence
+# Typed transactional settings
 
 Independent small-settings core. No FormatKit, TemporalKit or FieldKit dependency. Supported value kinds are text,
 Boolean and exact Int64; no floating-point coercions or nullable values.
