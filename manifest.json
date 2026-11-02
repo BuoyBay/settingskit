@@ -1,1 +1,1 @@
-{"schema":1,"name":"settingskit","version":"0.1.0","description":"Typed transactional settings and explicit persistence capabilities"}
+{"schema":1,"name":"settingskit","version":"0.1.0","description":"Manage typed transactional settings and persistence"}
