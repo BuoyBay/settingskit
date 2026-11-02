@@ -47,8 +47,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
-
 ## Contributing
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)

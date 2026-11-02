@@ -99,8 +99,6 @@ Call `refresh` to resolve a stale writer; same-revision divergent documents are
 accepted as external replacements and notified. Account adapters require caller
 transport; browser-local storage never means account preferences.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 Install the `atomicfilekit` 0.1.0 dependency alongside this package. The sealed
 archive includes the standalone companion at `resources/browser.mjs` and this
 contract at `resources/buoy-docs/index.md`. No runtime JSON dependency is needed. An existing empty file, Prefs string or
